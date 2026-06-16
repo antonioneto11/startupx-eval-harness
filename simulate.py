@@ -24,13 +24,17 @@ TEMPLATES = {
 }
 
 
-def grade_n_trials(answer, question, judge_fn, template, n_trials):
-    """Run the judge n_trials times on one answer; collect per-criterion labels."""
+def grade_n_trials(answer, question, judge_fn, template, n_trials, facts=OFFERING_FACTS):
+    """Run the judge n_trials times on one answer; collect per-criterion labels.
+
+    `facts` is the ground truth the judge grades against; pass a scenario's own
+    facts so the judge audits the answer against that scenario, not the base case.
+    """
     per_crit = defaultdict(list)          # criterion -> [PASS/FAIL per trial]
     per_crit_cells = {}                   # criterion -> last full cell (reason/evidence)
     raws = []
     for _ in range(n_trials):
-        prompt = template.format(question=question, answer=answer, facts=OFFERING_FACTS)
+        prompt = template.format(question=question, answer=answer, facts=facts)
         raw = judge_fn(prompt)
         raws.append(raw)
         jj = parse_judge_output(raw)
@@ -62,19 +66,21 @@ def grade_n_trials(answer, question, judge_fn, template, n_trials):
 
 
 def run_simulation(question, api_key, model="claude-opus-4-8", n_trials=8,
-                   which=("hardened",), pass_k=3):
+                   which=("hardened",), pass_k=3, facts=OFFERING_FACTS):
     """
     Full live run. `which` is any subset of ("plain", "hardened").
+    `facts` is the ground truth for this run (scenario-specific or the base case);
+    the agent answers under it AND the judge grades against it.
     Returns {"answer": str, "results": {template_label: trial_summary}, "pass_k": k}.
     """
     agent_fn = make_anthropic_agent(model=model, api_key=api_key)
-    answer = agent_fn(question)
+    answer = agent_fn(question, facts=facts)
 
     results = {}
     for label in which:
         template, system = TEMPLATES[label]
         judge_fn = make_anthropic_judge(model=model, system=system, api_key=api_key)
-        summary = grade_n_trials(answer, question, judge_fn, template, n_trials)
+        summary = grade_n_trials(answer, question, judge_fn, template, n_trials, facts=facts)
         k = min(pass_k, n_trials)
         summary["pass_k"] = st.pass_hat_k(summary["gate_pass_per_trial"], k)
         summary["pass_k_k"] = k

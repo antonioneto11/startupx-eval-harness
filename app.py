@@ -16,6 +16,10 @@ import streamlit as st
 from grader import ALL_CRITERIA, CRITICAL, OFFERING_FACTS
 from dataset import QUESTION as DEFAULT_QUESTION
 from simulate import run_simulation, explain
+from scenarios import SCENARIOS, render_facts
+
+CAT_ICON = {"realistic": "🟦", "gate_breaker": "🟥", "bias_trap": "🟨"}
+SCEN_BY_ID = {s["id"]: s for s in SCENARIOS}
 
 st.set_page_config(page_title="StartupX Compliance Eval", page_icon="⚖️", layout="wide")
 
@@ -49,7 +53,35 @@ with st.sidebar:
 st.title("⚖️ StartupX Compliance Eval Harness")
 st.caption("Investor question → live agent answers → LLM judge grades it against the compliance rubric.")
 
-question = st.text_area("Investor question", value=DEFAULT_QUESTION, height=90)
+# scenario picker: choose a bank scenario (which carries its own facts + trap)
+# or free-text. The selected scenario seeds the question and the ground truth.
+FREE = "✏️ Free text"
+choice = st.selectbox(
+    "Scenario", [FREE] + [s["id"] for s in SCENARIOS],
+    format_func=lambda x: x if x == FREE
+    else f"{CAT_ICON[SCEN_BY_ID[x]['category']]} {SCEN_BY_ID[x]['category']:<12} · {x}",
+    help="Pick a scenario from the bank (each carries its own facts + engineered trap), or free-text.",
+)
+
+scenario = SCEN_BY_ID.get(choice)
+if scenario:
+    facts = render_facts(scenario["facts"])
+    seed_q = scenario["question"]
+    if scenario["category"] != "realistic":
+        st.warning(f"**Trap — {scenario['category']}:** {scenario.get('trap', '')}")
+    with st.expander("What a correct answer must / must not do (reviewer intent)"):
+        cols = st.columns(2)
+        cols[0].markdown("**Must**\n\n" + "\n".join(f"- {m}" for m in scenario["expected"]["must"]))
+        cols[1].markdown("**Must not**\n\n" + "\n".join(f"- {m}" for m in scenario["expected"]["must_not"]))
+    if facts != OFFERING_FACTS:
+        with st.expander("This scenario overrides the base offering facts"):
+            st.code(facts)
+else:
+    facts = OFFERING_FACTS
+    seed_q = DEFAULT_QUESTION
+
+# key by choice so switching scenarios reseeds the box, while still allowing edits
+question = st.text_area("Investor question", value=seed_q, height=90, key=f"q_{choice}")
 run = st.button("Run simulation", type="primary", disabled=not question.strip())
 
 
@@ -94,7 +126,7 @@ if run:
         with st.spinner("Agent is answering, then the judge is grading N times…"):
             out = run_simulation(
                 question.strip(), api_key=api_key or None, model=model,
-                n_trials=n_trials, which=tuple(which_labels),
+                n_trials=n_trials, which=tuple(which_labels), facts=facts,
             )
     except Exception as e:  # surface API/auth/parse errors to the user
         st.error(f"Run failed: {type(e).__name__}: {e}")
