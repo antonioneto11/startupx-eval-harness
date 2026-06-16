@@ -1,0 +1,4 @@
+# Core harness (runner.py, compare_judges.py, test_eval.py) is pure stdlib.
+# These are only needed for the LIVE judge/agent and the GUI:
+anthropic>=0.96
+streamlit>=1.58
