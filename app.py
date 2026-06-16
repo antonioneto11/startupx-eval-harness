@@ -15,7 +15,7 @@ import streamlit as st
 
 from grader import ALL_CRITERIA, CRITICAL, OFFERING_FACTS
 from dataset import QUESTION as DEFAULT_QUESTION
-from simulate import run_simulation, explain
+from simulate import run_simulation, run_paired_bias, explain
 from scenarios import SCENARIOS, render_facts
 
 CAT_ICON = {"realistic": "🟦", "gate_breaker": "🟥", "bias_trap": "🟨"}
@@ -80,6 +80,17 @@ else:
     facts = OFFERING_FACTS
     seed_q = DEFAULT_QUESTION
 
+# bias_trap scenarios can run a PAIRED measurement: one base answer -> two style
+# variants with identical compliance content -> judge both -> bias gap.
+bias_axis = scenario.get("bias_axis") if scenario else None
+paired = False
+if bias_axis:
+    paired = st.checkbox(
+        f"Measure judge bias (paired, axis: {bias_axis})", value=True,
+        help="Generate one compliant answer, rewrite it into two style variants "
+             "with identical compliance content, grade both, and report the bias gap.",
+    )
+
 # key by choice so switching scenarios reseeds the box, while still allowing edits
 question = st.text_area("Investor question", value=seed_q, height=90, key=f"q_{choice}")
 run = st.button("Run simulation", type="primary", disabled=not question.strip())
@@ -114,6 +125,41 @@ def render_template_result(label, summary, answer, n_trials):
         st.markdown("- " + line)
 
 
+def render_paired(out):
+    """Render the paired bias measurement: two style variants + per-judge gap."""
+    st.markdown("### Base compliant answer")
+    st.info(out["base"])
+    st.caption(f"Rewritten into two variants on the **{out['axis']}** axis — "
+               "identical compliance content, style only differs. A fair judge "
+               "must grade them the same.")
+
+    a, b = out["label_a"], out["label_b"]
+    ca, cb = st.columns(2)
+    ca.markdown(f"**Variant A — {a}**"); ca.write(out["answer_a"])
+    cb.markdown(f"**Variant B — {b}**"); cb.write(out["answer_b"])
+
+    for label, r in out["results"].items():
+        st.markdown(f"### {LABELS[label]} — bias gap")
+        gap = r["gap"]
+        if gap:
+            st.error(f"⚖️ BIASED on **{out['axis']}**: the judge graded the two "
+                     f"equal-content answers DIFFERENTLY on {', '.join(gap)}. "
+                     f"That difference is the measured bias.")
+        else:
+            st.success(f"No bias on **{out['axis']}**: both variants got identical "
+                       f"labels on every criterion.")
+        rows = []
+        for c in ALL_CRITERIA:
+            la, lb = r["a"]["majority"][c], r["b"]["majority"][c]
+            rows.append({
+                "criterion": c + (" (critical)" if c in CRITICAL else ""),
+                f"A · {a}": CRIT_BADGE[la],
+                f"B · {b}": CRIT_BADGE[lb],
+                "differs?": "⚠️" if la != lb else "",
+            })
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+
+
 if run:
     if not (api_key or os.environ.get("ANTHROPIC_API_KEY")):
         st.error("No API key. Paste an Anthropic API key in the sidebar.")
@@ -122,14 +168,26 @@ if run:
         st.error("Pick at least one judge prompt in the sidebar.")
         st.stop()
 
+    mode = "paired" if (paired and bias_axis) else "single"
     try:
-        with st.spinner("Agent is answering, then the judge is grading N times…"):
-            out = run_simulation(
-                question.strip(), api_key=api_key or None, model=model,
-                n_trials=n_trials, which=tuple(which_labels), facts=facts,
-            )
+        if mode == "paired":
+            with st.spinner("Generating base answer, two style variants, then grading both…"):
+                out = run_paired_bias(
+                    question.strip(), api_key=api_key or None, axis=bias_axis,
+                    model=model, n_trials=n_trials, which=tuple(which_labels), facts=facts,
+                )
+        else:
+            with st.spinner("Agent is answering, then the judge is grading N times…"):
+                out = run_simulation(
+                    question.strip(), api_key=api_key or None, model=model,
+                    n_trials=n_trials, which=tuple(which_labels), facts=facts,
+                )
     except Exception as e:  # surface API/auth/parse errors to the user
         st.error(f"Run failed: {type(e).__name__}: {e}")
+        st.stop()
+
+    if mode == "paired":
+        render_paired(out)
         st.stop()
 
     st.markdown("### Agent's answer (under test)")

@@ -15,7 +15,7 @@ from collections import defaultdict
 from grader import (parse_judge_output, score_one, ALL_CRITERIA, CRITICAL,
                     OFFERING_FACTS, JUDGE_TEMPLATE, JUDGE_TEMPLATE_HARDENED,
                     JUDGE_SYSTEM, JUDGE_SYSTEM_HARDENED, make_anthropic_judge)
-from agent import make_anthropic_agent
+from agent import make_anthropic_agent, make_anthropic_styler, PAIR_AXES
 import evalstats as st
 
 TEMPLATES = {
@@ -87,6 +87,39 @@ def run_simulation(question, api_key, model="claude-opus-4-8", n_trials=8,
         results[label] = summary
 
     return {"answer": answer, "results": results, "n_trials": n_trials}
+
+
+def run_paired_bias(question, api_key, axis, model="claude-opus-4-8", n_trials=8,
+                    which=("hardened",), facts=OFFERING_FACTS):
+    """
+    Bias measurement for a bias_trap scenario. Generate one compliant base answer,
+    rewrite it into two style variants (a/b) that share compliance content but
+    differ only along `axis`, then grade BOTH N times under each judge. The bias
+    gap = criteria where the two variants' majority labels differ (empty = the
+    judge is unbiased on this axis; non-empty = a measured style bias).
+    """
+    agent_fn = make_anthropic_agent(model=model, api_key=api_key)
+    base = agent_fn(question, facts=facts)
+
+    styler = make_anthropic_styler(model=model, api_key=api_key)
+    variants = styler(base, axis)            # {"a": ..., "b": ...}
+    label_a, _, label_b, _ = PAIR_AXES[axis]
+
+    results = {}
+    for label in which:
+        template, system = TEMPLATES[label]
+        judge_fn = make_anthropic_judge(model=model, system=system, api_key=api_key)
+        sa = grade_n_trials(variants["a"], question, judge_fn, template, n_trials, facts=facts)
+        sb = grade_n_trials(variants["b"], question, judge_fn, template, n_trials, facts=facts)
+        gap = [c for c in ALL_CRITERIA if sa["majority"][c] != sb["majority"][c]]
+        results[label] = {"a": sa, "b": sb, "gap": gap}
+
+    return {
+        "base": base, "axis": axis,
+        "answer_a": variants["a"], "answer_b": variants["b"],
+        "label_a": label_a, "label_b": label_b,
+        "results": results, "n_trials": n_trials,
+    }
 
 
 def explain(answer, summary, n_trials, label):
