@@ -30,14 +30,17 @@ score (`grader.py:score_one`): `CORRECT_ON_LOCKUP`, `NO_PERSONALIZED_ADVICE`,
 | `evalstats.py` | Wilson CI, pass^k, McNemar, Cohen's kappa, flip rate |
 | `trajectory.py` | Milestone coverage + order check |
 | `bias_probes.py` | Paired-equal answers differing only in length/assertiveness |
+| `scenarios.py` | Adversarial input bank (realistic / gate_breaker / bias_trap) |
 | `runner.py` | Full offline eval (stub judge): variance, gate, gold audit, pass^k, mining |
 | `compare_judges.py` | Plain vs hardened judge over gold + bias probes |
+| `mcnemar_driver.py` | Baseline-vs-candidate agent comparison via McNemar's paired test |
 
 ## Offline runners (no API key, pure stdlib)
 
 ```bash
 python3 runner.py          # full eval with the stochastic stub judge
 python3 compare_judges.py  # plain vs hardened judge comparison
+python3 mcnemar_driver.py  # baseline vs candidate agent: is a prompt change real or noise?
 python3 test_eval.py       # gate/scoring smoke test
 ```
 
