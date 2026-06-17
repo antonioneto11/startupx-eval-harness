@@ -22,11 +22,14 @@ score (`grader.py:score_one`): `CORRECT_ON_LOCKUP`, `NO_PERSONALIZED_ADVICE`,
 
 | File | Role |
 |---|---|
+| `tools.py` | Tool registry the live agent calls (canned data; real selection/sequencing) |
+| `agent.py` | Live agent: `run_agent` plan-act loop (+ live brain) and the single-shot answerer/styler used by the GUI |
+| `agent_stub.py` | Offline agent brains: a competent `llm_fn` + broken variants |
+| `agent_run.py` | **Live-agent entry point**: real loop → existing trajectory + gate scorers |
 | `grader.py` | Judge prompts (plain + hardened), gate-aware scoring, live judge factory |
-| `agent.py` | The live agent **under test** (answers the investor question) |
 | `simulate.py` | One-shot live run: agent → judge ×N → gate score + reliability + bias |
 | `app.py` | **Streamlit GUI** — ask a question, run the simulation, read the result |
-| `dataset.py` | Frozen golden cases with human gold labels (audits the judge) |
+| `dataset.py` | Frozen golden cases + human gold labels (now **judge-audit fixtures** — the agent is live) |
 | `evalstats.py` | Wilson CI, pass^k, McNemar, Cohen's kappa, flip rate |
 | `trajectory.py` | Milestone coverage + order check |
 | `bias_probes.py` | Paired-equal answers differing only in length/assertiveness |
@@ -38,6 +41,7 @@ score (`grader.py:score_one`): `CORRECT_ON_LOCKUP`, `NO_PERSONALIZED_ADVICE`,
 ## Offline runners (no API key, pure stdlib)
 
 ```bash
+python3 agent_run.py       # LIVE agent loop (stub brain): plans, calls tools, gets graded
 python3 runner.py          # full eval with the stochastic stub judge
 python3 compare_judges.py  # plain vs hardened judge comparison
 python3 mcnemar_driver.py  # baseline vs candidate agent: is a prompt change real or noise?
@@ -46,6 +50,33 @@ python3 test_eval.py       # gate/scoring smoke test
 
 These use **stub judges** so the math and plumbing validate without network. Stub
 numbers reflect the stub, not real model behavior.
+
+## Live agent loop (`agent_run.py`)
+
+The agent is **real**, not scripted: `agent.run_agent` is a plan-act loop where
+the brain (`llm_fn`) decides *which* tool in `tools.py` to call, in what order,
+recovers from malformed calls / tool errors, and composes the answer. The
+trajectory the harness grades is the agent's **actual** executed tool sequence
+(plus the milestones its answer achieves), never a hardcoded list. Its real
+answer flows into `grader.score_one` and its real trajectory into
+`trajectory.trajectory_score` — both **unchanged**.
+
+`agent_run.py` runs a competent agent plus three broken variants so the existing
+harness visibly catches *real* agentic failures:
+
+| variant | what breaks | how the harness catches it |
+|---|---|---|
+| competent | nothing | gate pass, trajectory 1.0, matches gold-001 |
+| skips-lookup | never calls `lookup_holding_restriction` | **outcome passes but trajectory 0.8** (missing milestone) |
+| gives-advice | advises selling | **gate 0.0** on `NO_PERSONALIZED_ADVICE` |
+| loops | never finalizes | **step-limit** termination, trajectory 0.2 |
+
+Offline it uses a deterministic stub brain (`agent_stub.py`). For the live path,
+inject `agent.make_anthropic_agent_llm("claude-opus-4-8")` as the brain and
+`grader.make_anthropic_judge(...)` as the judge — same `run_agent`/scorers, no
+code change. `dataset.py`'s scripted answers remain as the **judge-audit
+fixtures** they always were (gold labels the judge is calibrated against); the
+agent that produces *new* answers is now the live loop.
 
 ## Live GUI (real Claude)
 

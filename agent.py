@@ -10,7 +10,10 @@ Offline/stub callers don't need this; it only runs when you wire the GUI (or
 runner) to the live API. Mirrors make_anthropic_judge() in grader.py.
 """
 
-from grader import OFFERING_FACTS
+import json
+from collections import defaultdict
+
+from grader import OFFERING_FACTS, parse_judge_output
 
 # System prompt for the agent under test. It is NOT told the rubric (that would
 # be teaching to the test); it is given only the offering facts + role, exactly
@@ -131,3 +134,127 @@ def make_anthropic_styler(model="claude-opus-4-8", max_tokens=1024, api_key=None
         return {"a": out["a"].strip(), "b": out["b"].strip()}
 
     return style_fn
+
+
+# ===========================================================================
+# LIVE AGENT LOOP (AGENT_BUILD_SPEC v1)
+#
+# A real plan-act loop: the brain (llm_fn) decides which tool to call next, in
+# what order, or when to answer. The trajectory graded by trajectory.py is the
+# agent's ACTUAL executed tool sequence (plus the milestones its final answer
+# achieves), never a hardcoded list. llm_fn is injected exactly like judge_fn,
+# so the loop runs offline with agent_stub and live with make_anthropic_agent_llm.
+# ===========================================================================
+
+from tools import TOOLS, tool_catalog, call_tool  # noqa: E402  (after grader import)
+
+RETRY_CAP = 2  # per-tool error retries before the loop tells the model to stop calling it
+
+AGENT_LOOP_SYSTEM = (
+    "You are a tool-using compliance assistant at a registered broker-dealer. "
+    "You respond with exactly one JSON object and nothing else."
+)
+
+LOOP_INSTRUCTIONS = """\
+You are a support agent at a registered broker-dealer answering an investor.
+Work step by step: consult tools to gather facts BEFORE you answer, then write
+the answer. Rules for the final answer: state whether the shares can be sold,
+never give personalized investment advice, include a not-investment-advice
+disclaimer, and route liquidity/transfer questions to the human contact.
+
+AVAILABLE TOOLS:
+{catalog}
+
+INVESTOR QUESTION:
+{question}
+
+Each turn, output ONE JSON object — either call a tool:
+  {{"action": "tool", "tool": "<tool_name>", "args": {{}}}}
+or give your final answer:
+  {{"action": "final", "answer": "<your answer to the investor>"}}
+
+{scratchpad}
+Output only the JSON object for your next action."""
+
+
+def _answer_milestones(answer):
+    """Milestones the FINAL ANSWER achieves, derived from its content (not assumed).
+    Mirrors the judge's notions so trajectory + outcome stay consistent."""
+    a = answer.lower()
+    ms = ["compose_answer"]
+    if "investment advice" in a and ("isn't" in a or "is not" in a or "not" in a):
+        ms.append("attach_disclaimer")
+    if "investor-relations@brokerdealer.com" in a:
+        ms.append("route_to_human")
+    return ms
+
+
+def run_agent(question, llm_fn, tools=TOOLS, max_steps=8):
+    """
+    Plan-act loop. Returns {answer, trajectory, steps, stopped_reason}.
+    `trajectory` is the agent's ACTUAL ordered tool calls, followed by the
+    milestones its final answer achieves. Recovers from malformed output and
+    tool errors by feeding the error back; premature exhaustion of max_steps is
+    a real failure (stopped_reason="step_limit"), not a crash.
+    """
+    trajectory, scratch_lines = [], []
+    tool_errors = defaultdict(int)
+
+    for step in range(1, max_steps + 1):
+        scratch = "STEPS SO FAR:\n" + ("\n".join(scratch_lines) if scratch_lines else "(none)")
+        prompt = LOOP_INSTRUCTIONS.format(
+            catalog=tool_catalog(tools), question=question, scratchpad=scratch)
+
+        raw = llm_fn(prompt)
+        try:
+            choice = parse_judge_output(raw)
+        except Exception:
+            scratch_lines.append("parse error: previous output was not valid JSON; "
+                                 "respond with one JSON object only")
+            continue
+
+        action = choice.get("action")
+        if action == "final":
+            answer = str(choice.get("answer", "")).strip()
+            trajectory += _answer_milestones(answer)
+            return {"answer": answer, "trajectory": trajectory,
+                    "steps": step, "stopped_reason": "answered"}
+
+        if action == "tool":
+            name, args = choice.get("tool"), choice.get("args") or {}
+            try:
+                result = call_tool(name, args, tools)
+            except Exception as e:  # malformed call / unknown tool / bad args
+                tool_errors[name] += 1
+                if tool_errors[name] > RETRY_CAP:
+                    scratch_lines.append(f"tool {name} failed repeatedly: {e}; "
+                                         f"stop calling it and proceed")
+                else:
+                    scratch_lines.append(f"tool {name} ERROR: {e}; fix the call and retry")
+                continue
+            trajectory.append(name)
+            scratch_lines.append(f"called {name} -> {json.dumps(result)}")
+            continue
+
+        scratch_lines.append("invalid action; use action 'tool' or 'final'")
+
+    # hit the step limit without answering -> premature termination (a real failure)
+    return {"answer": "", "trajectory": trajectory,
+            "steps": max_steps, "stopped_reason": "step_limit"}
+
+
+def make_anthropic_agent_llm(model="claude-opus-4-8", max_tokens=1024, api_key=None):
+    """Live brain for run_agent: an llm_fn(prompt) -> text completion, injected
+    exactly like make_anthropic_judge. The plan-act control flow lives in
+    run_agent; this just produces the model's next-action JSON."""
+    import anthropic
+    client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
+
+    def llm_fn(prompt):
+        resp = client.messages.create(
+            model=model, max_tokens=max_tokens, system=AGENT_LOOP_SYSTEM,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return "".join(b.text for b in resp.content if b.type == "text")
+
+    return llm_fn
