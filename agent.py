@@ -14,6 +14,7 @@ import json
 from collections import defaultdict
 
 from grader import OFFERING_FACTS, parse_judge_output
+from observability import observe, update_trace, span
 
 # System prompt for the agent under test. It is NOT told the rubric (that would
 # be teaching to the test); it is given only the offering facts + role, exactly
@@ -189,6 +190,7 @@ def _answer_milestones(answer):
     return ms
 
 
+@observe(name="agent-loop", capture_input=False, capture_output=False)
 def run_agent(question, llm_fn, tools=TOOLS, max_steps=8):
     """
     Plan-act loop. Returns {answer, trajectory, steps, stopped_reason}.
@@ -197,6 +199,7 @@ def run_agent(question, llm_fn, tools=TOOLS, max_steps=8):
     tool errors by feeding the error back; premature exhaustion of max_steps is
     a real failure (stopped_reason="step_limit"), not a crash.
     """
+    update_trace(input={"question": question, "max_steps": max_steps})
     trajectory, scratch_lines = [], []
     tool_errors = defaultdict(int)
 
@@ -217,13 +220,20 @@ def run_agent(question, llm_fn, tools=TOOLS, max_steps=8):
         if action == "final":
             answer = str(choice.get("answer", "")).strip()
             trajectory += _answer_milestones(answer)
-            return {"answer": answer, "trajectory": trajectory,
-                    "steps": step, "stopped_reason": "answered"}
+            result = {"answer": answer, "trajectory": trajectory,
+                      "steps": step, "stopped_reason": "answered"}
+            update_trace(output=result)
+            return result
 
         if action == "tool":
             name, args = choice.get("tool"), choice.get("args") or {}
             try:
-                result = call_tool(name, args, tools)
+                # Each executed tool call is a child span, so the traced trajectory
+                # mirrors the agent's ACTUAL tool sequence.
+                with span(f"tool:{name}", input={"tool": name, "args": args}) as s:
+                    result = call_tool(name, args, tools)
+                    if s is not None:
+                        s.update(output=result)
             except Exception as e:  # malformed call / unknown tool / bad args
                 tool_errors[name] += 1
                 if tool_errors[name] > RETRY_CAP:
@@ -239,8 +249,10 @@ def run_agent(question, llm_fn, tools=TOOLS, max_steps=8):
         scratch_lines.append("invalid action; use action 'tool' or 'final'")
 
     # hit the step limit without answering -> premature termination (a real failure)
-    return {"answer": "", "trajectory": trajectory,
-            "steps": max_steps, "stopped_reason": "step_limit"}
+    result = {"answer": "", "trajectory": trajectory,
+              "steps": max_steps, "stopped_reason": "step_limit"}
+    update_trace(output=result)
+    return result
 
 
 def make_anthropic_agent_llm(model="claude-opus-4-8", max_tokens=1024, api_key=None):

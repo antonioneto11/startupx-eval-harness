@@ -11,12 +11,20 @@ Needs an ANTHROPIC_API_KEY (paste in the sidebar, or set it in the environment).
 """
 
 import os
+import uuid
 import streamlit as st
 
+import observability
 from grader import ALL_CRITERIA, CRITICAL, OFFERING_FACTS
 from dataset import QUESTION as DEFAULT_QUESTION
 from simulate import run_simulation, run_paired_bias, explain
 from scenarios import SCENARIOS, render_facts
+
+# One Langfuse session per browser session, so every simulation a user runs is
+# grouped together in the Langfuse Sessions view (no-op when tracing is off).
+if "langfuse_session_id" not in st.session_state:
+    st.session_state["langfuse_session_id"] = f"streamlit-{uuid.uuid4()}"
+SESSION_ID = st.session_state["langfuse_session_id"]
 
 CAT_ICON = {"realistic": "🟦", "gate_breaker": "🟥", "bias_trap": "🟨"}
 SCEN_BY_ID = {s["id"]: s for s in SCENARIOS}
@@ -168,6 +176,11 @@ if run:
         st.error("Pick at least one judge prompt in the sidebar.")
         st.stop()
 
+    # Tracing-only labels so runs are filterable in Langfuse by scenario.
+    run_tags = [f"scenario:{choice}"] if scenario else ["scenario:free-text"]
+    if scenario:
+        run_tags.append(f"category:{scenario['category']}")
+
     mode = "paired" if (paired and bias_axis) else "single"
     try:
         if mode == "paired":
@@ -175,16 +188,21 @@ if run:
                 out = run_paired_bias(
                     question.strip(), api_key=api_key or None, axis=bias_axis,
                     model=model, n_trials=n_trials, which=tuple(which_labels), facts=facts,
+                    session_id=SESSION_ID, tags=run_tags,
                 )
         else:
             with st.spinner("Agent is answering, then the judge is grading N times…"):
                 out = run_simulation(
                     question.strip(), api_key=api_key or None, model=model,
                     n_trials=n_trials, which=tuple(which_labels), facts=facts,
+                    session_id=SESSION_ID, tags=run_tags,
                 )
     except Exception as e:  # surface API/auth/parse errors to the user
         st.error(f"Run failed: {type(e).__name__}: {e}")
         st.stop()
+    finally:
+        # Streamlit reruns are short interactions; flush so traces aren't lost.
+        observability.flush()
 
     if mode == "paired":
         render_paired(out)

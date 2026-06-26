@@ -2,3 +2,8 @@
 # These are only needed for the LIVE judge/agent and the GUI:
 anthropic>=0.96
 streamlit>=1.58
+
+# Optional: Langfuse tracing (only needed when LANGFUSE_* env vars are set).
+# The harness runs fine without these installed when tracing is disabled.
+langfuse>=4.0
+opentelemetry-instrumentation-anthropic>=0.40
