@@ -93,6 +93,34 @@ streamlit run app.py
 
 Default model is `claude-opus-4-8` (Sonnet 4.6 / Haiku 4.5 also selectable).
 
+## Observability (Langfuse)
+
+The live agent/judge paths are instrumented with [Langfuse](https://langfuse.com). Tracing is
+**opt-in and silent when off**: set the env vars below to enable it; leave them unset and the
+harness behaves exactly as before (the offline, pure-stdlib runners need no extra dependency).
+
+```bash
+pip install langfuse opentelemetry-instrumentation-anthropic
+export LANGFUSE_PUBLIC_KEY=pk-lf-...
+export LANGFUSE_SECRET_KEY=sk-lf-...
+export LANGFUSE_BASE_URL=https://cloud.langfuse.com   # or us./your self-hosted URL
+```
+
+What gets traced (see `observability.py`):
+
+- **`compliance-simulation`** / **`bias-measurement`** — one trace per GUI run, grouping the
+  agent answer and every judge re-grade. Trace input/output carry the question and the
+  gate verdict.
+- **`judge-trials`** — the N judge re-grades of one answer, with flip rates in metadata.
+- **`agent-loop`** — the live plan-act loop (`run_agent`), with one child span per executed
+  tool call so the traced trajectory mirrors the agent's actual tool sequence.
+- Every live Anthropic `messages.create` (agent, styler, judge) is auto-captured as a
+  `generation` (model, tokens, cost, latency) via the OpenTelemetry Anthropic instrumentor.
+- **Sessions / tags** — each Streamlit session is one Langfuse session; runs are tagged by
+  scenario, category, model, and bias axis for filtering.
+- **Masking** — card/SSN/phone-like strings are redacted from exported spans (the IR contact
+  email is deliberately kept visible, since the judge grades on it).
+
 ## How to read the output
 
 - **Gate score:** critical failure → 0.0; clean answer → up to 5.0.

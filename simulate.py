@@ -16,6 +16,7 @@ from grader import (parse_judge_output, score_one, ALL_CRITERIA, CRITICAL,
                     OFFERING_FACTS, JUDGE_TEMPLATE, JUDGE_TEMPLATE_HARDENED,
                     JUDGE_SYSTEM, JUDGE_SYSTEM_HARDENED, make_anthropic_judge)
 from agent import make_anthropic_agent, make_anthropic_styler, PAIR_AXES
+from observability import observe, trace_context, update_trace
 import evalstats as st
 
 TEMPLATES = {
@@ -24,12 +25,15 @@ TEMPLATES = {
 }
 
 
+@observe(name="judge-trials", capture_input=False, capture_output=False)
 def grade_n_trials(answer, question, judge_fn, template, n_trials, facts=OFFERING_FACTS):
     """Run the judge n_trials times on one answer; collect per-criterion labels.
 
     `facts` is the ground truth the judge grades against; pass a scenario's own
     facts so the judge audits the answer against that scenario, not the base case.
     """
+    # Trace input is set explicitly (the prompt/judge_fn args are large/non-serializable).
+    update_trace(input={"question": question, "answer": answer, "n_trials": n_trials})
     per_crit = defaultdict(list)          # criterion -> [PASS/FAIL per trial]
     per_crit_cells = {}                   # criterion -> last full cell (reason/evidence)
     raws = []
@@ -54,6 +58,9 @@ def grade_n_trials(answer, question, judge_fn, template, n_trials, facts=OFFERIN
 
     score, gate_failed = score_one({"criteria": {c: {"result": majority[c]} for c in ALL_CRITERIA}})
 
+    update_trace(output={"score": score, "gate_failed": gate_failed, "majority": majority},
+                 metadata={"flips": flips})
+
     return {
         "majority": majority,
         "flips": flips,
@@ -65,56 +72,86 @@ def grade_n_trials(answer, question, judge_fn, template, n_trials, facts=OFFERIN
     }
 
 
+@observe(name="compliance-simulation", capture_input=False, capture_output=False)
 def run_simulation(question, api_key, model="claude-opus-4-8", n_trials=8,
-                   which=("hardened",), pass_k=3, facts=OFFERING_FACTS):
+                   which=("hardened",), pass_k=3, facts=OFFERING_FACTS,
+                   session_id=None, tags=None):
     """
     Full live run. `which` is any subset of ("plain", "hardened").
     `facts` is the ground truth for this run (scenario-specific or the base case);
     the agent answers under it AND the judge grades against it.
     Returns {"answer": str, "results": {template_label: trial_summary}, "pass_k": k}.
+
+    `session_id`/`tags` are tracing-only: they group this run in Langfuse (no
+    effect when tracing is disabled).
     """
-    agent_fn = make_anthropic_agent(model=model, api_key=api_key)
-    answer = agent_fn(question, facts=facts)
+    with trace_context(
+        session_id=session_id,
+        tags=(list(tags) if tags else []) + ["startupx-eval", "simulation", f"model:{model}"],
+        metadata={"n_trials": n_trials, "judges": list(which)},
+    ):
+        update_trace(input={"question": question, "model": model, "n_trials": n_trials})
 
-    results = {}
-    for label in which:
-        template, system = TEMPLATES[label]
-        judge_fn = make_anthropic_judge(model=model, system=system, api_key=api_key)
-        summary = grade_n_trials(answer, question, judge_fn, template, n_trials, facts=facts)
-        k = min(pass_k, n_trials)
-        summary["pass_k"] = st.pass_hat_k(summary["gate_pass_per_trial"], k)
-        summary["pass_k_k"] = k
-        results[label] = summary
+        agent_fn = make_anthropic_agent(model=model, api_key=api_key)
+        answer = agent_fn(question, facts=facts)
 
-    return {"answer": answer, "results": results, "n_trials": n_trials}
+        results = {}
+        for label in which:
+            template, system = TEMPLATES[label]
+            judge_fn = make_anthropic_judge(model=model, system=system, api_key=api_key)
+            summary = grade_n_trials(answer, question, judge_fn, template, n_trials, facts=facts)
+            k = min(pass_k, n_trials)
+            summary["pass_k"] = st.pass_hat_k(summary["gate_pass_per_trial"], k)
+            summary["pass_k_k"] = k
+            results[label] = summary
+
+        update_trace(output={
+            "answer": answer,
+            "verdict": {label: {"score": r["score"], "gate_failed": r["gate_failed"]}
+                        for label, r in results.items()},
+        })
+        return {"answer": answer, "results": results, "n_trials": n_trials}
 
 
+@observe(name="bias-measurement", capture_input=False, capture_output=False)
 def run_paired_bias(question, api_key, axis, model="claude-opus-4-8", n_trials=8,
-                    which=("hardened",), facts=OFFERING_FACTS):
+                    which=("hardened",), facts=OFFERING_FACTS,
+                    session_id=None, tags=None):
     """
     Bias measurement for a bias_trap scenario. Generate one compliant base answer,
     rewrite it into two style variants (a/b) that share compliance content but
     differ only along `axis`, then grade BOTH N times under each judge. The bias
     gap = criteria where the two variants' majority labels differ (empty = the
     judge is unbiased on this axis; non-empty = a measured style bias).
+
+    `session_id`/`tags` are tracing-only (no effect when tracing is disabled).
     """
-    agent_fn = make_anthropic_agent(model=model, api_key=api_key)
-    base = agent_fn(question, facts=facts)
+    with trace_context(
+        session_id=session_id,
+        tags=(list(tags) if tags else []) + ["startupx-eval", "bias-probe", f"axis:{axis}", f"model:{model}"],
+        metadata={"n_trials": n_trials, "axis": axis, "judges": list(which)},
+    ):
+        update_trace(input={"question": question, "model": model, "axis": axis})
 
-    styler = make_anthropic_styler(model=model, api_key=api_key)
-    variants = styler(base, axis)            # {"a": ..., "b": ...}
-    label_a, _, label_b, _ = PAIR_AXES[axis]
+        agent_fn = make_anthropic_agent(model=model, api_key=api_key)
+        base = agent_fn(question, facts=facts)
 
-    results = {}
-    for label in which:
-        template, system = TEMPLATES[label]
-        judge_fn = make_anthropic_judge(model=model, system=system, api_key=api_key)
-        sa = grade_n_trials(variants["a"], question, judge_fn, template, n_trials, facts=facts)
-        sb = grade_n_trials(variants["b"], question, judge_fn, template, n_trials, facts=facts)
-        gap = [c for c in ALL_CRITERIA if sa["majority"][c] != sb["majority"][c]]
-        results[label] = {"a": sa, "b": sb, "gap": gap}
+        styler = make_anthropic_styler(model=model, api_key=api_key)
+        variants = styler(base, axis)            # {"a": ..., "b": ...}
+        label_a, _, label_b, _ = PAIR_AXES[axis]
 
-    return {
+        results = {}
+        for label in which:
+            template, system = TEMPLATES[label]
+            judge_fn = make_anthropic_judge(model=model, system=system, api_key=api_key)
+            sa = grade_n_trials(variants["a"], question, judge_fn, template, n_trials, facts=facts)
+            sb = grade_n_trials(variants["b"], question, judge_fn, template, n_trials, facts=facts)
+            gap = [c for c in ALL_CRITERIA if sa["majority"][c] != sb["majority"][c]]
+            results[label] = {"a": sa, "b": sb, "gap": gap}
+
+        update_trace(output={"axis": axis,
+                             "bias_gap": {label: r["gap"] for label, r in results.items()}})
+        return {
         "base": base, "axis": axis,
         "answer_a": variants["a"], "answer_b": variants["b"],
         "label_a": label_a, "label_b": label_b,
